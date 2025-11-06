@@ -1,14 +1,13 @@
 """
 Database Helper Functions
-Refactored with security improvements and modern Python practices
+Refactored for Python 3.9+ with security improvements
 """
 
 import sqlite3
 import os
-from pathlib import Path
-from typing import Optional, Any
-from datetime import datetime
 from contextlib import contextmanager
+from datetime import datetime
+from typing import Optional, List, Dict, Any
 import hashlib
 import secrets
 
@@ -20,58 +19,43 @@ def get_db_connection():
     """
     Context manager for database connections.
     
-    Ensures connections are properly closed even if errors occur.
+    Ensures proper connection handling and automatic cleanup.
     
     Yields:
-        sqlite3.Connection: Active database connection
+        sqlite3.Connection: Database connection object
     """
     conn = sqlite3.connect(DATABASE_PATH)
+    conn.row_factory = sqlite3.Row
     try:
         yield conn
     finally:
         conn.close()
 
 
-def hash_password(password: str) -> str:
+def hash_password(password: str, salt: Optional[bytes] = None) -> tuple[str, str]:
     """
-    Hash a password using SHA-256 with salt.
+    Hash a password using PBKDF2 with SHA-256.
     
     Args:
         password: Plain text password to hash
+        salt: Optional salt bytes, generated if not provided
         
     Returns:
-        str: Salted and hashed password in format "salt$hash"
+        tuple: (hashed_password_hex, salt_hex)
     """
-    salt = secrets.token_hex(16)
-    pwd_hash = hashlib.sha256((salt + password).encode()).hexdigest()
-    return f"{salt}${pwd_hash}"
-
-
-def verify_password(password: str, hashed: str) -> bool:
-    """
-    Verify a password against its hash.
+    if salt is None:
+        salt = secrets.token_bytes(32)
     
-    Args:
-        password: Plain text password to verify
-        hashed: Stored hash in format "salt$hash"
-        
-    Returns:
-        bool: True if password matches, False otherwise
-    """
-    try:
-        salt, stored_hash = hashed.split('$')
-        pwd_hash = hashlib.sha256((salt + password).encode()).hexdigest()
-        return pwd_hash == stored_hash
-    except (ValueError, AttributeError):
-        return False
+    pwd_hash = hashlib.pbkdf2_hmac('sha256', password.encode('utf-8'), salt, 100000)
+    return pwd_hash.hex(), salt.hex()
 
 
 def init_db() -> None:
     """
     Initialize database with users table.
     
-    Creates the users table if it doesn't exist. Password field is designed
-    to store hashed passwords with salt.
+    Creates the users table if it doesn't exist. Updated to include
+    salt field for password hashing.
     """
     with get_db_connection() as conn:
         cursor = conn.cursor()
@@ -81,13 +65,14 @@ def init_db() -> None:
                 username TEXT UNIQUE NOT NULL,
                 email TEXT NOT NULL,
                 password TEXT NOT NULL,
+                salt TEXT NOT NULL,
                 created_at TEXT NOT NULL
             )
         """)
         conn.commit()
 
 
-def get_user_by_username(username: str) -> Optional[tuple]:
+def get_user_by_username(username: str) -> Optional[sqlite3.Row]:
     """
     Get user by username using parameterized query.
     
@@ -95,13 +80,13 @@ def get_user_by_username(username: str) -> Optional[tuple]:
         username: Username to search for
         
     Returns:
-        Optional[tuple]: User record tuple or None if not found
+        User row if found, None otherwise
     """
     with get_db_connection() as conn:
         cursor = conn.cursor()
         cursor.execute("SELECT * FROM users WHERE username = ?", (username,))
         result = cursor.fetchone()
-    return result
+        return result
 
 
 def authenticate_user(username: str, password: str) -> bool:
@@ -118,15 +103,21 @@ def authenticate_user(username: str, password: str) -> bool:
     with get_db_connection() as conn:
         cursor = conn.cursor()
         cursor.execute(
-            "SELECT password FROM users WHERE username = ?",
+            "SELECT password, salt FROM users WHERE username = ?",
             (username,)
         )
-        result = cursor.fetchone()
-    
-    if result:
-        stored_hash = result[0]
-        return verify_password(password, stored_hash)
-    return False
+        user = cursor.fetchone()
+        
+        if not user:
+            return False
+        
+        stored_hash = user['password']
+        salt = bytes.fromhex(user['salt'])
+        
+        # Hash the provided password with stored salt
+        computed_hash, _ = hash_password(password, salt)
+        
+        return computed_hash == stored_hash
 
 
 def create_user(username: str, email: str, password: str) -> bool:
@@ -134,8 +125,8 @@ def create_user(username: str, email: str, password: str) -> bool:
     Create new user with hashed password.
     
     Args:
-        username: Username for new user
-        email: Email address for new user
+        username: Unique username
+        email: User email address
         password: Plain text password (will be hashed)
         
     Returns:
@@ -144,39 +135,41 @@ def create_user(username: str, email: str, password: str) -> bool:
     Raises:
         sqlite3.IntegrityError: If username already exists
     """
-    hashed_password = hash_password(password)
-    created = datetime.now().isoformat()
-    
     with get_db_connection() as conn:
         cursor = conn.cursor()
+        created = datetime.now().isoformat()
+        
+        # Hash password with generated salt
+        pwd_hash, salt = hash_password(password)
+        
         cursor.execute(
-            "INSERT INTO users (username, email, password, created_at) VALUES (?, ?, ?, ?)",
-            (username, email, hashed_password, created)
+            "INSERT INTO users (username, email, password, salt, created_at) VALUES (?, ?, ?, ?, ?)",
+            (username, email, pwd_hash, salt, created)
         )
         conn.commit()
-    return True
+        return True
 
 
-def get_all_users() -> list[dict[str, Any]]:
+def get_all_users() -> List[Dict[str, Any]]:
     """
     Get all users without sensitive information.
     
     Returns:
-        list[dict[str, Any]]: List of user dictionaries with id, username, email
+        List of user dictionaries containing id, username, and email
     """
     with get_db_connection() as conn:
         cursor = conn.cursor()
         cursor.execute("SELECT id, username, email FROM users")
         users = cursor.fetchall()
-    
-    return [
-        {
-            "id": user[0],
-            "username": user[1],
-            "email": user[2]
-        }
-        for user in users
-    ]
+        
+        return [
+            {
+                "id": user['id'],
+                "username": user['username'],
+                "email": user['email']
+            }
+            for user in users
+        ]
 
 
 def delete_user(user_id: int) -> None:
@@ -184,7 +177,7 @@ def delete_user(user_id: int) -> None:
     Delete user by ID using parameterized query.
     
     Args:
-        user_id: ID of user to delete
+        user_id: User ID to delete
     """
     with get_db_connection() as conn:
         cursor = conn.cursor()
@@ -192,7 +185,7 @@ def delete_user(user_id: int) -> None:
         conn.commit()
 
 
-def search_users(search_term: str) -> list[tuple]:
+def search_users(search_term: str) -> List[sqlite3.Row]:
     """
     Search users by username using parameterized query.
     
@@ -200,7 +193,7 @@ def search_users(search_term: str) -> list[tuple]:
         search_term: Term to search for in usernames
         
     Returns:
-        list[tuple]: List of matching user records
+        List of matching user rows
     """
     with get_db_connection() as conn:
         cursor = conn.cursor()
@@ -209,4 +202,4 @@ def search_users(search_term: str) -> list[tuple]:
             (f"%{search_term}%",)
         )
         results = cursor.fetchall()
-    return results
+        return results
